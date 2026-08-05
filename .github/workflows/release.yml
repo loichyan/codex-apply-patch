@@ -1,0 +1,230 @@
+name: Release Codex apply_patch
+
+on:
+  schedule:
+    # Every Sunday at 12:00 UTC.
+    - cron: "0 12 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-codex-apply-patch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check upstream release
+    runs-on: ubuntu-latest
+    outputs:
+      updated: ${{ steps.version.outputs.updated }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v6
+
+      - name: Check | Latest Codex release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current_version="$(tr -d '[:space:]' < CODEX_VERSION)"
+          latest_tag="$(gh api repos/openai/codex/releases/latest --jq '.tag_name')"
+
+          if [[ ! "${latest_tag}" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Unexpected Codex release tag: ${latest_tag}"
+            exit 1
+          fi
+
+          latest_version="${latest_tag#rust-v}"
+          echo "tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${latest_version}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${latest_version}" == "${current_version}" ]]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "Codex is already at ${current_version}."
+          else
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "Updating Codex from ${current_version:-<none>} to ${latest_version}."
+          fi
+
+  build:
+    name: Build apply_patch
+    needs: check
+    if: needs.check.outputs.updated == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            archive: unix
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            archive: unix
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux/arm64
+            image: alpine3.22
+            archive: unix
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            platform: linux/amd64
+            image: alpine3.22
+            archive: unix
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux/arm64
+            image: bookworm
+            archive: unix
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            platform: linux/amd64
+            image: bookworm
+            archive: unix
+          - runner: windows-2022
+            target: aarch64-pc-windows-msvc
+            archive: windows
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            archive: windows
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Setup | Checkout Codex
+        run: |
+          git clone --depth 1 --branch "${{ needs.check.outputs.tag }}" https://github.com/openai/codex.git codex
+
+      - name: Setup | Rust toolchain metadata
+        id: metadata
+        run: |
+          toolchain="$(awk -F'"' '/^channel = / { print $2; exit }' codex/codex-rs/rust-toolchain.toml)"
+          [[ -n "${toolchain}" ]] || { echo "Codex Rust toolchain not found."; exit 1; }
+          echo "toolchain=${toolchain}" >> "$GITHUB_OUTPUT"
+
+      - name: Setup | Rust
+        if: runner.os != 'Linux'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.metadata.outputs.toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Build | Build [Cargo]
+        if: runner.os != 'Linux'
+        working-directory: codex/codex-rs
+        run: |
+          cargo build --release --target "${TARGET}" --package codex-apply-patch --bin apply_patch
+
+      - name: Build | Build [Docker]
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --volume "${GITHUB_WORKSPACE}/codex:/src" \
+            --workdir /src/codex-rs \
+            -e TARGET="${TARGET}" \
+            -e OPENSSL_STATIC=1 \
+            -e OPENSSL_NO_VENDOR=1 \
+            -e DEBIAN_FRONTEND=noninteractive \
+            "rust:${{ steps.metadata.outputs.toolchain }}-${{ matrix.image }}" \
+            sh -e -c '
+              case "${{ matrix.image }}" in
+                alpine*)
+                  apk add --no-cache build-base git pkgconf openssl-dev openssl-libs-static
+                  ;;
+                bookworm)
+                  apt-get update
+                  apt-get install --yes --no-install-recommends build-essential git pkg-config libssl-dev
+                  ;;
+                *)
+                  echo "unreachable"
+                  exit 1
+                  ;;
+              esac
+
+              cargo build --release --target "${TARGET}" --package codex-apply-patch --bin apply_patch
+            '
+
+      - name: Post Build | Prepare artifacts
+        working-directory: codex/codex-rs
+        run: |
+          dist="${GITHUB_WORKSPACE}/dist"
+          mkdir -p "${dist}"
+          cp "${GITHUB_WORKSPACE}/codex/LICENSE" "${dist}/LICENSE"
+          cp "${GITHUB_WORKSPACE}/codex/NOTICE" "${dist}/NOTICE"
+
+          # Keep the Codex licensing and attribution notices with its binary.
+          case "${{ matrix.archive }}" in
+            unix)
+              install -m 0755 "target/${TARGET}/release/apply_patch" "${dist}/apply_patch"
+              (cd "${dist}" && tar -czf "apply_patch-${TARGET}.tar.gz" "apply_patch" LICENSE NOTICE)
+              rm "${dist}/apply_patch"
+              ;;
+            windows)
+              cp "target/${TARGET}/release/apply_patch.exe" "${dist}/apply_patch.exe"
+              (cd "${dist}" && 7z a "apply_patch-${TARGET}.zip" "apply_patch.exe" LICENSE NOTICE)
+              rm "${dist}/apply_patch.exe"
+              ;;
+            *)
+              echo "unreachable"
+              exit 1
+              ;;
+          esac
+
+          rm "${dist}/LICENSE" "${dist}/NOTICE"
+
+      - name: Release | Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: apply-patch-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create release
+    needs: [check, build]
+    if: needs.check.outputs.updated == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: Setup | Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup | Artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: apply-patch-*
+          path: dist
+          merge-multiple: true
+
+      - name: Release | Update version
+        run: |
+          printf '%s\n' "${RELEASE_VERSION}" > CODEX_VERSION
+          git add CODEX_VERSION
+          git diff --cached --quiet && { echo "CODEX_VERSION did not change."; exit 1; }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -m "Bump Codex version to ${RELEASE_VERSION}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Release | Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release_tag="v${RELEASE_VERSION}"
+          git tag -a "${release_tag}" -m "Release ${RELEASE_VERSION}"
+          git push origin "${release_tag}"
+          gh release create "${release_tag}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --latest \
+            --title "${RELEASE_VERSION}" \
+            --notes "Release ${RELEASE_VERSION}, see <https://github.com/openai/codex/releases/tag/${{ needs.check.outputs.tag }}> for more information."
